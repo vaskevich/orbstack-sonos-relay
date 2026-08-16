@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass
 
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 SSDP_MULTICAST = "239.255.255.250"
 SSDP_BROADCAST = "255.255.255.255"
 SSDP_PORT = 1900
@@ -24,6 +24,8 @@ DEFAULT_EVENT_PORTS = "1400-1499"
 TCPDUMP = "/usr/sbin/tcpdump"
 IFCONFIG = "/sbin/ifconfig"
 PCAP_LINKTYPE_ETHERNET = 1
+SONOS_HTTP_PORT = 1400
+CAPTURE_FILTER = "(udp and dst port 1900) or (tcp and dst port 1400)"
 
 
 def log(message: str) -> None:
@@ -93,6 +95,14 @@ class MSearchPacket:
     payload: bytes
 
 
+@dataclass(frozen=True)
+class TCPPacket:
+    source_ip: str
+    source_port: int
+    destination_ip: str
+    destination_port: int
+
+
 def parse_msearch_packet(packet: bytes) -> MSearchPacket | None:
     """Parse an Ethernet/IPv4/UDP SSDP M-SEARCH captured by tcpdump."""
     if len(packet) < 14:
@@ -139,6 +149,43 @@ def parse_msearch_packet(packet: bytes) -> MSearchPacket | None:
     )
 
 
+def parse_tcp_packet(packet: bytes) -> TCPPacket | None:
+    """Parse safe endpoint metadata from an Ethernet/IPv4/TCP packet."""
+    if len(packet) < 14:
+        return None
+    ether_type = struct.unpack("!H", packet[12:14])[0]
+    offset = 14
+    if ether_type in (0x8100, 0x88A8):
+        if len(packet) < 18:
+            return None
+        ether_type = struct.unpack("!H", packet[16:18])[0]
+        offset = 18
+    if ether_type != 0x0800 or len(packet) < offset + 20:
+        return None
+
+    ip = packet[offset:]
+    version, ihl = ip[0] >> 4, (ip[0] & 0x0F) * 4
+    if version != 4 or ihl < 20 or len(ip) < ihl + 20 or ip[9] != socket.IPPROTO_TCP:
+        return None
+    total_length = struct.unpack("!H", ip[2:4])[0]
+    if total_length < ihl + 20 or len(ip) < total_length:
+        return None
+    if struct.unpack("!H", ip[6:8])[0] & 0x3FFF:
+        return None
+
+    tcp = ip[ihl:total_length]
+    data_offset = (tcp[12] >> 4) * 4
+    if data_offset < 20 or data_offset > len(tcp):
+        return None
+    source_port, destination_port = struct.unpack("!HH", tcp[:4])
+    return TCPPacket(
+        source_ip=socket.inet_ntoa(ip[12:16]),
+        source_port=source_port,
+        destination_ip=socket.inet_ntoa(ip[16:20]),
+        destination_port=destination_port,
+    )
+
+
 class SearchDeduplicator:
     """Suppress HA's identical multicast/broadcast search pair briefly."""
 
@@ -168,19 +215,33 @@ class BackendState:
     def __init__(self, configured_ip: str | None) -> None:
         self.configured_ip = configured_ip
         self.discovered_ip: str | None = None
-        self._lock = threading.Lock()
+        self._condition = threading.Condition()
+
+    @property
+    def automatic(self) -> bool:
+        return self.configured_ip is None
 
     def get(self) -> str | None:
-        with self._lock:
+        with self._condition:
             return self.configured_ip or self.discovered_ip
 
-    def observe(self, address: str) -> bool:
-        with self._lock:
+    def wait(self, timeout: float) -> str | None:
+        """Wait briefly for auto-detection, returning immediately if configured."""
+        with self._condition:
+            self._condition.wait_for(
+                lambda: self.configured_ip is not None or self.discovered_ip is not None,
+                timeout=timeout,
+            )
+            return self.configured_ip or self.discovered_ip
+
+    def observe(self, address: str, source: str = "observed traffic") -> bool:
+        with self._condition:
             if self.configured_ip:
                 return address == self.configured_ip
             if self.discovered_ip is None:
                 self.discovered_ip = address
-                log(f"HA: learned and pinned OrbStack address {address}")
+                log(f"HA: learned and pinned OrbStack address {address} from {source}")
+                self._condition.notify_all()
                 return True
             return address == self.discovered_ip
 
@@ -192,6 +253,24 @@ def interface_ipv4(name: str) -> str:
         if len(fields) >= 2 and fields[0] == "inet":
             return fields[1]
     raise RuntimeError(f"no IPv4 address found on interface {name}")
+
+
+def interface_ipv4_network(name: str) -> ipaddress.IPv4Network | None:
+    """Read the interface subnet from macOS ifconfig's hexadecimal netmask."""
+    output = subprocess.check_output([IFCONFIG, name], text=True, stderr=subprocess.DEVNULL)
+    for line in output.splitlines():
+        fields = line.strip().split()
+        if len(fields) < 4 or fields[0] != "inet" or "netmask" not in fields:
+            continue
+        try:
+            address = ipaddress.IPv4Address(fields[1])
+            mask_text = fields[fields.index("netmask") + 1]
+            mask = ipaddress.IPv4Address(int(mask_text, 16) if mask_text.startswith("0x") else mask_text)
+            network = ipaddress.ip_network(f"{address}/{mask}", strict=False)
+        except (ValueError, IndexError):
+            return None
+        return network if isinstance(network, ipaddress.IPv4Network) else None
+    return None
 
 
 def wait_for_interface_ipv4(name: str, stop: threading.Event) -> str:
@@ -208,11 +287,13 @@ def wait_for_interface_ipv4(name: str, stop: threading.Event) -> str:
 
 
 class SSDPRelay:
-    def __init__(self, *, lan_ip: str, orb_ip: str, orb_interface: str,
+    def __init__(self, *, lan_ip: str, orb_ip: str,
+                 orb_network: ipaddress.IPv4Network | None, orb_interface: str,
                  backend: BackendState, stop: threading.Event, verbose: bool,
                  minimum_reply_window: float) -> None:
         self.lan_ip = lan_ip
         self.orb_ip = orb_ip
+        self.orb_network = orb_network
         self.orb_interface = orb_interface
         self.backend = backend
         self.stop_event = stop
@@ -220,14 +301,36 @@ class SSDPRelay:
         self.minimum_reply_window = minimum_reply_window
         self.deduplicator = SearchDeduplicator()
         self.process: subprocess.Popen[bytes] | None = None
+        self._capture_thread: threading.Thread | None = None
+        self._capture_ready = threading.Event()
+        self._capture_error: Exception | None = None
         self._relay_threads: set[threading.Thread] = set()
         self._threads_lock = threading.Lock()
 
     def handle_packet(self, packet: bytes) -> None:
+        tcp = parse_tcp_packet(packet)
+        if tcp is not None:
+            if (
+                self.backend.automatic
+                and tcp.destination_port == SONOS_HTTP_PORT
+                and tcp.source_ip != self.orb_ip
+                and (
+                    self.orb_network is None
+                    or ipaddress.IPv4Address(tcp.source_ip) in self.orb_network
+                )
+            ):
+                self.backend.observe(tcp.source_ip, "outbound Sonos TCP")
+            return
+
         search = parse_msearch_packet(packet)
         if search is None or search.source_ip == self.orb_ip:
             return
-        if not self.backend.observe(search.source_ip):
+        if (
+            self.orb_network is not None
+            and ipaddress.IPv4Address(search.source_ip) not in self.orb_network
+        ):
+            return
+        if not self.backend.observe(search.source_ip, "SSDP M-SEARCH"):
             debug(self.verbose, f"SSDP: ignored M-SEARCH from non-HA client {search.source_ip}")
             return
         client = (search.source_ip, search.source_port)
@@ -294,10 +397,42 @@ class SSDPRelay:
             outbound.close()
             reply_socket.close()
 
+    def start(self) -> None:
+        """Start capture and wait until tcpdump's pcap stream is ready."""
+        self._capture_thread = threading.Thread(
+            target=self._capture_main,
+            name="bridge-capture",
+            daemon=True,
+        )
+        self._capture_thread.start()
+        if not self._capture_ready.wait(timeout=10.0):
+            self.stop()
+            raise RuntimeError("timed out waiting for tcpdump capture to become ready")
+        if self._capture_error is not None:
+            raise self._capture_error
+
+    def _capture_main(self) -> None:
+        try:
+            self.run()
+        except Exception as exc:
+            self._capture_error = exc
+        finally:
+            self._capture_ready.set()
+
+    def wait(self) -> None:
+        """Wait for capture to stop and propagate an unexpected failure."""
+        thread = self._capture_thread
+        if thread is None:
+            raise RuntimeError("capture has not been started")
+        while thread.is_alive() and not self.stop_event.is_set():
+            thread.join(timeout=0.5)
+        if self._capture_error is not None:
+            raise self._capture_error
+
     def run(self) -> None:
         command = [TCPDUMP, "-n", "-U", "-s", "0", "-i", self.orb_interface,
-                   "-w", "-", "udp and dst port 1900"]
-        log(f"SSDP: capturing HA M-SEARCH on {self.orb_interface}")
+                   "-w", "-", CAPTURE_FILTER]
+        log(f"Capture: monitoring HA/Sonos SSDP and TCP on {self.orb_interface}")
         self.process = subprocess.Popen(command, stdout=subprocess.PIPE)
         assert self.process.stdout is not None
         stream = self.process.stdout
@@ -315,6 +450,7 @@ class SSDPRelay:
         linktype = struct.unpack(endian + "I", global_header[20:24])[0]
         if linktype != PCAP_LINKTYPE_ETHERNET:
             raise RuntimeError(f"tcpdump returned unsupported pcap link type {linktype}; expected Ethernet")
+        self._capture_ready.set()
 
         while not self.stop_event.is_set():
             header = stream.read(16)
@@ -337,20 +473,24 @@ class SSDPRelay:
             try:
                 process.terminate()
             except ProcessLookupError:
-                return
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
+                pass
+            else:
                 try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-                else:
                     process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    else:
+                        process.wait(timeout=2)
         with self._threads_lock:
             threads = list(self._relay_threads)
         for thread in threads:
             thread.join(timeout=1.0)
+        capture_thread = self._capture_thread
+        if capture_thread is not None and capture_thread is not threading.current_thread():
+            capture_thread.join(timeout=2.0)
 
 
 class CallbackProxy:
@@ -417,10 +557,10 @@ class CallbackProxy:
             self._connections.difference_update(sockets)
 
     def _handle_connection(self, client: socket.socket, address: tuple[str, int], port: int) -> None:
-        backend_ip = self.backend.get()
+        backend_ip = self.backend.wait(timeout=0.75)
         if backend_ip is None:
             log(f"Events: rejected callback from {address[0]}:{address[1]} on :{port}; "
-                "HA address has not been learned yet")
+                "HA address was not learned within 0.75 seconds")
             client.close()
             return
         try:
@@ -544,19 +684,27 @@ def main(argv: list[str] | None = None) -> int:
     try:
         lan_ip = wait_for_interface_ipv4(args.lan, stop_event)
         orb_ip = wait_for_interface_ipv4(args.orb, stop_event)
+        try:
+            orb_network = interface_ipv4_network(args.orb)
+        except (OSError, subprocess.CalledProcessError):
+            orb_network = None
         if backend.get() == orb_ip:
             raise RuntimeError("--ha-ip must not be the macOS bridge address")
         log(f"orbstack-sonos-relay {VERSION}")
         log(f"LAN: {args.lan} = {lan_ip}")
         log(f"ORB: {args.orb} = {orb_ip}")
-        log(f"HA:  {backend.get() or 'auto-detect and pin from first M-SEARCH'}")
+        log(f"HA:  {backend.get() or 'auto-detect from outbound Sonos TCP or SSDP M-SEARCH'}")
+        if orb_network is None:
+            log("ORB: warning: could not determine bridge subnet; auto-detection subnet check disabled")
         proxy = CallbackProxy(listen_ip=lan_ip, ports=ports, backend=backend,
                               stop=stop_event, verbose=args.verbose)
-        relay = SSDPRelay(lan_ip=lan_ip, orb_ip=orb_ip, orb_interface=args.orb,
+        relay = SSDPRelay(lan_ip=lan_ip, orb_ip=orb_ip, orb_network=orb_network,
+                          orb_interface=args.orb,
                           backend=backend, stop=stop_event, verbose=args.verbose,
                           minimum_reply_window=args.reply_window)
+        relay.start()
         proxy.start()
-        relay.run()
+        relay.wait()
     except KeyboardInterrupt:
         stop_event.set()
     except Exception as exc:
