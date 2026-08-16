@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import ipaddress
+import re
 import selectors
 import signal
 import socket
@@ -14,6 +15,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 
 VERSION = "1.0.1"
@@ -23,8 +25,10 @@ SSDP_PORT = 1900
 DEFAULT_EVENT_PORTS = "1400-1499"
 TCPDUMP = "/usr/sbin/tcpdump"
 IFCONFIG = "/sbin/ifconfig"
+ARP = "/usr/sbin/arp"
 PCAP_LINKTYPE_ETHERNET = 1
 SONOS_HTTP_PORT = 1400
+NEIGHBOR_PROBE_TIMEOUT = 0.2
 CAPTURE_FILTER = "(udp and dst port 1900) or (tcp and dst port 1400)"
 
 
@@ -101,6 +105,20 @@ class TCPPacket:
     source_port: int
     destination_ip: str
     destination_port: int
+
+
+@dataclass(frozen=True)
+class NeighborDiscoveryResult:
+    candidates: tuple[str, ...]
+    accepted: tuple[str, ...]
+
+    @property
+    def selected(self) -> str | None:
+        return self.accepted[0] if len(self.accepted) == 1 else None
+
+    @property
+    def ambiguous(self) -> bool:
+        return len(self.accepted) > 1
 
 
 def parse_msearch_packet(packet: bytes) -> MSearchPacket | None:
@@ -184,6 +202,109 @@ def parse_tcp_packet(packet: bytes) -> TCPPacket | None:
         destination_ip=socket.inet_ntoa(ip[16:20]),
         destination_port=destination_port,
     )
+
+
+def parse_arp_neighbors(
+    text: str,
+    *,
+    bridge_ip: str,
+    bridge_network: ipaddress.IPv4Network | None,
+) -> list[str]:
+    """Parse usable IPv4 unicast neighbors from macOS ``arp -an`` output."""
+    own_address = ipaddress.IPv4Address(bridge_ip)
+    candidates: set[ipaddress.IPv4Address] = set()
+    pattern = re.compile(
+        r"\(?((?:[0-9]{1,3}\.){3}[0-9]{1,3})\)?\s+at\s+(\S+)",
+        re.IGNORECASE,
+    )
+    mac_pattern = re.compile(r"(?:[0-9a-f]{1,2}:){5}[0-9a-f]{1,2}\Z", re.IGNORECASE)
+
+    for line in text.splitlines():
+        match = pattern.search(line)
+        if match is None or mac_pattern.fullmatch(match.group(2)) is None:
+            continue
+        try:
+            address = ipaddress.IPv4Address(match.group(1))
+        except ipaddress.AddressValueError:
+            continue
+        first_mac_octet = int(match.group(2).split(":", 1)[0], 16)
+        if first_mac_octet & 1:
+            # Multicast/broadcast link-layer mappings are not host neighbors.
+            continue
+        if (
+            address == own_address
+            or address == ipaddress.IPv4Address("255.255.255.255")
+            or address.is_multicast
+            or address.is_unspecified
+            or address.is_loopback
+            or address.is_reserved
+        ):
+            continue
+        if bridge_network is not None and address in (
+            bridge_network.network_address,
+            bridge_network.broadcast_address,
+        ):
+            continue
+        candidates.add(address)
+
+    return [
+        str(address)
+        for address in sorted(
+            candidates,
+            key=lambda address: (
+                bridge_network is None or address not in bridge_network,
+                int(address),
+            ),
+        )
+    ]
+
+
+def discover_backend_from_neighbors(
+    interface: str,
+    bridge_ip: str,
+    bridge_network: ipaddress.IPv4Network | None,
+    port: int,
+    *,
+    connector: Callable[..., socket.socket] = socket.create_connection,
+    runner: Callable[..., str] = subprocess.check_output,
+) -> NeighborDiscoveryResult:
+    """Probe existing bridge neighbors on one callback port; never scan a subnet."""
+    output = runner(
+        [ARP, "-an", "-i", interface],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+    candidates = parse_arp_neighbors(
+        output,
+        bridge_ip=bridge_ip,
+        bridge_network=bridge_network,
+    )
+    in_subnet = [
+        candidate
+        for candidate in candidates
+        if bridge_network is not None
+        and ipaddress.IPv4Address(candidate) in bridge_network
+    ]
+    probe_candidates = in_subnet or candidates
+    accepted: list[str] = []
+    for candidate in probe_candidates:
+        probe: socket.socket | None = None
+        try:
+            probe = connector(
+                (candidate, port),
+                timeout=NEIGHBOR_PROBE_TIMEOUT,
+            )
+        except OSError:
+            continue
+        else:
+            accepted.append(candidate)
+        finally:
+            if probe is not None:
+                try:
+                    probe.close()
+                except OSError:
+                    pass
+    return NeighborDiscoveryResult(tuple(probe_candidates), tuple(accepted))
 
 
 class SearchDeduplicator:
@@ -497,17 +618,27 @@ class CallbackProxy:
     """Proxy every selected LAN TCP port to the same port on HA."""
 
     def __init__(self, *, listen_ip: str, ports: list[int], backend: BackendState,
-                 stop: threading.Event, verbose: bool) -> None:
+                 orb_interface: str, orb_ip: str,
+                 orb_network: ipaddress.IPv4Network | None,
+                 stop: threading.Event, verbose: bool,
+                 connector: Callable[..., socket.socket] = socket.create_connection,
+                 arp_runner: Callable[..., str] = subprocess.check_output) -> None:
         self.listen_ip = listen_ip
         self.ports = ports
         self.backend = backend
+        self.orb_interface = orb_interface
+        self.orb_ip = orb_ip
+        self.orb_network = orb_network
         self.stop_event = stop
         self.verbose = verbose
+        self.connector = connector
+        self.arp_runner = arp_runner
         self.selector = selectors.DefaultSelector()
         self.listeners: list[socket.socket] = []
         self.thread: threading.Thread | None = None
         self._connections: set[socket.socket] = set()
         self._connections_lock = threading.Lock()
+        self._backend_discovery_lock = threading.Lock()
 
     def start(self) -> None:
         bound: list[int] = []
@@ -556,15 +687,52 @@ class CallbackProxy:
         with self._connections_lock:
             self._connections.difference_update(sockets)
 
+    def resolve_backend(self, port: int) -> str | None:
+        """Resolve an early callback through known neighbors, then packet traffic."""
+        backend_ip = self.backend.get()
+        if backend_ip is not None or not self.backend.automatic:
+            return backend_ip
+
+        # Serialize simultaneous early callbacks so they do not repeat probes.
+        with self._backend_discovery_lock:
+            backend_ip = self.backend.get()
+            if backend_ip is not None:
+                return backend_ip
+            try:
+                discovery = discover_backend_from_neighbors(
+                    self.orb_interface,
+                    self.orb_ip,
+                    self.orb_network,
+                    port,
+                    connector=self.connector,
+                    runner=self.arp_runner,
+                )
+            except (OSError, subprocess.CalledProcessError) as exc:
+                debug(self.verbose, f"HA: bridge neighbor lookup failed: {exc}")
+            else:
+                if discovery.selected is not None:
+                    self.backend.observe(
+                        discovery.selected,
+                        f"bridge neighbor accepting TCP :{port}",
+                    )
+                elif discovery.ambiguous:
+                    log(
+                        f"HA: bridge neighbor discovery on TCP :{port} is ambiguous; "
+                        f"accepted by {', '.join(discovery.accepted)}"
+                    )
+
+        # Packet capture may identify HA while neighbor discovery is running.
+        return self.backend.wait(timeout=0.75)
+
     def _handle_connection(self, client: socket.socket, address: tuple[str, int], port: int) -> None:
-        backend_ip = self.backend.wait(timeout=0.75)
+        backend_ip = self.resolve_backend(port)
         if backend_ip is None:
             log(f"Events: rejected callback from {address[0]}:{address[1]} on :{port}; "
                 "HA address was not learned within 0.75 seconds")
             client.close()
             return
         try:
-            upstream = socket.create_connection((backend_ip, port), timeout=5)
+            upstream = self.connector((backend_ip, port), timeout=5)
         except OSError as exc:
             log(f"Events: backend connection to {backend_ip}:{port} failed: {exc}")
             client.close()
@@ -693,11 +861,21 @@ def main(argv: list[str] | None = None) -> int:
         log(f"orbstack-sonos-relay {VERSION}")
         log(f"LAN: {args.lan} = {lan_ip}")
         log(f"ORB: {args.orb} = {orb_ip}")
-        log(f"HA:  {backend.get() or 'auto-detect from outbound Sonos TCP or SSDP M-SEARCH'}")
+        log(
+            f"HA:  {backend.get() or 'auto-detect from bridge neighbors, outbound Sonos TCP, or SSDP M-SEARCH'}"
+        )
         if orb_network is None:
             log("ORB: warning: could not determine bridge subnet; auto-detection subnet check disabled")
-        proxy = CallbackProxy(listen_ip=lan_ip, ports=ports, backend=backend,
-                              stop=stop_event, verbose=args.verbose)
+        proxy = CallbackProxy(
+            listen_ip=lan_ip,
+            ports=ports,
+            backend=backend,
+            orb_interface=args.orb,
+            orb_ip=orb_ip,
+            orb_network=orb_network,
+            stop=stop_event,
+            verbose=args.verbose,
+        )
         relay = SSDPRelay(lan_ip=lan_ip, orb_ip=orb_ip, orb_network=orb_network,
                           orb_interface=args.orb,
                           backend=backend, stop=stop_event, verbose=args.verbose,

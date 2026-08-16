@@ -97,6 +97,16 @@ MSEARCH = (
     b"ST:ssdp:all\r\n\r\n"
 )
 
+ARP_OUTPUT = """\
+? (192.168.139.2) at 2:aa:bb:cc:dd:ee on bridge100 ifscope [ethernet]
+? (192.168.139.3) at a:bb:cc:dd:ee:ff on bridge100 permanent [bridge]
+? (192.168.139.4) at (incomplete) on bridge100 ifscope [ethernet]
+? (192.168.139.5) at no entry on bridge100
+? (192.168.139.255) at ff:ff:ff:ff:ff:ff on bridge100
+? (224.0.0.251) at 1:0:5e:0:0:fb on bridge100 permanent [ethernet]
+? (255.255.255.255) at ff:ff:ff:ff:ff:ff on bridge100 permanent [ethernet]
+"""
+
 
 class PortParsingTests(unittest.TestCase):
     def test_single_ranges_and_duplicates(self):
@@ -186,6 +196,147 @@ class TCPPacketTests(unittest.TestCase):
             relay.CAPTURE_FILTER,
             "(udp and dst port 1900) or (tcp and dst port 1400)",
         )
+
+
+class NeighborDiscoveryTests(unittest.TestCase):
+    network = ipaddress.ip_network("192.168.139.0/24")
+
+    def test_parses_normal_macos_arp_and_ignores_unusable_entries(self):
+        self.assertEqual(
+            relay.parse_arp_neighbors(
+                ARP_OUTPUT,
+                bridge_ip="192.168.139.3",
+                bridge_network=self.network,
+            ),
+            ["192.168.139.2"],
+        )
+
+    def test_ignores_bridge_multicast_broadcast_and_incomplete_entries(self):
+        text = """\
+? (192.168.139.3) at 2:0:0:0:0:3 on bridge100 permanent
+? (192.168.139.4) at (incomplete) on bridge100
+? (224.0.0.1) at 2:0:0:0:0:1 on bridge100 permanent
+? (255.255.255.255) at 2:0:0:0:0:ff on bridge100 permanent
+"""
+        self.assertEqual(
+            relay.parse_arp_neighbors(
+                text,
+                bridge_ip="192.168.139.3",
+                bridge_network=self.network,
+            ),
+            [],
+        )
+
+    def test_one_in_subnet_candidate_accepting_is_selected_and_closed(self):
+        probes = []
+
+        class Probe:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        def connector(address, *, timeout):
+            probes.append((address, timeout, Probe()))
+            return probes[-1][2]
+
+        arp_output = (
+            "? (10.0.0.8) at 2:0:0:0:0:8 on bridge100\n"
+            "? (192.168.139.2) at 2:0:0:0:0:2 on bridge100\n"
+        )
+        result = relay.discover_backend_from_neighbors(
+            "bridge100",
+            "192.168.139.3",
+            self.network,
+            1400,
+            connector=connector,
+            runner=lambda *_args, **_kwargs: arp_output,
+        )
+        self.assertEqual(result.selected, "192.168.139.2")
+        self.assertEqual([probe[0] for probe in probes], [("192.168.139.2", 1400)])
+        self.assertEqual(probes[0][1], relay.NEIGHBOR_PROBE_TIMEOUT)
+        self.assertTrue(probes[0][2].closed)
+
+    def test_zero_candidates_accepting_is_unresolved(self):
+        def refused(_address, *, timeout):
+            raise ConnectionRefusedError
+
+        result = relay.discover_backend_from_neighbors(
+            "bridge100",
+            "192.168.139.3",
+            self.network,
+            1400,
+            connector=refused,
+            runner=lambda *_args, **_kwargs: ARP_OUTPUT,
+        )
+        self.assertIsNone(result.selected)
+        self.assertFalse(result.ambiguous)
+        self.assertEqual(result.accepted, ())
+
+    def test_multiple_candidates_accepting_is_ambiguous(self):
+        class Probe:
+            def close(self):
+                pass
+
+        arp_output = (
+            "? (192.168.139.2) at 2:0:0:0:0:2 on bridge100\n"
+            "? (192.168.139.4) at 2:0:0:0:0:4 on bridge100\n"
+        )
+        result = relay.discover_backend_from_neighbors(
+            "bridge100",
+            "192.168.139.3",
+            self.network,
+            1400,
+            connector=lambda _address, *, timeout: Probe(),
+            runner=lambda *_args, **_kwargs: arp_output,
+        )
+        self.assertIsNone(result.selected)
+        self.assertTrue(result.ambiguous)
+        self.assertEqual(result.accepted, ("192.168.139.2", "192.168.139.4"))
+
+    def make_proxy(self, backend, *, connector, arp_runner):
+        proxy = relay.CallbackProxy(
+            listen_ip="192.168.86.240",
+            ports=[1400],
+            backend=backend,
+            orb_interface="bridge100",
+            orb_ip="192.168.139.3",
+            orb_network=self.network,
+            stop=threading.Event(),
+            verbose=False,
+            connector=connector,
+            arp_runner=arp_runner,
+        )
+        self.addCleanup(proxy.stop)
+        return proxy
+
+    def test_explicit_backend_bypasses_neighbor_discovery(self):
+        def unexpected(*_args, **_kwargs):
+            raise AssertionError("neighbor discovery should not run")
+
+        proxy = self.make_proxy(
+            relay.BackendState("192.168.139.2"),
+            connector=unexpected,
+            arp_runner=unexpected,
+        )
+        self.assertEqual(proxy.resolve_backend(1400), "192.168.139.2")
+
+    def test_callback_resolution_bootstraps_backend_from_arp_neighbor(self):
+        probes = []
+
+        class Probe:
+            def close(self):
+                probes.append("closed")
+
+        backend = relay.BackendState(None)
+        proxy = self.make_proxy(
+            backend,
+            connector=lambda address, *, timeout: Probe(),
+            arp_runner=lambda *_args, **_kwargs: ARP_OUTPUT,
+        )
+        self.assertEqual(proxy.resolve_backend(1400), "192.168.139.2")
+        self.assertEqual(backend.get(), "192.168.139.2")
+        self.assertEqual(probes, ["closed"])
 
 
 class DeduplicationTests(unittest.TestCase):

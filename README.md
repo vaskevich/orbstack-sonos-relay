@@ -51,7 +51,13 @@ HA / OrbStack                  relay on Mac                    physical LAN
 
 The raw Sonos SSDP `200 OK` responses are sent back to the source IP and UDP port of the original HA search. Other UPnP responses are not injected. No speaker IP addresses are configured or hardcoded.
 
-With `--ha-ip auto`, the relay learns the OrbStack-side HA address from observed HA/Sonos traffic. It accepts outbound TCP traffic to the Sonos UPnP endpoint on port 1400 as the preferred startup signal and also accepts HA SSDP M-SEARCH. TCP destination-port 1400 traffic normally occurs during Sonos setup or polling, so auto mode does not have to wait for the next periodic SSDP search. The bridge's own address and sources outside the detected OrbStack bridge subnet are excluded. The first learned address is pinned until the process restarts so it cannot oscillate between clients.
+With `--ha-ip auto`, the relay can learn the OrbStack-side HA address from three signals:
+
+1. When an early Sonos callback arrives before HA is known, existing IPv4 neighbors from the configured OrbStack bridge are tested on that same callback port. Only entries already present in macOS's ARP table are considered; the daemon does not scan the subnet. A backend is pinned only when exactly one candidate accepts the connection.
+2. Observed outbound HA TCP traffic to the Sonos UPnP endpoint on port 1400 identifies its source as HA. This traffic normally occurs during Sonos setup or polling.
+3. An observed HA SSDP M-SEARCH can identify its source as HA, as before.
+
+The neighbor lookup handles the common relay-restart case where Home Assistant is already running and may not immediately emit new setup, polling, or SSDP traffic before an existing Sonos callback arrives. The bridge's own address, unusable ARP entries, and non-unicast addresses are excluded, and candidates in the detected bridge subnet are preferred. The first learned address is pinned until the process restarts so it cannot oscillate between clients.
 
 ### UPnP event callbacks
 
@@ -66,7 +72,7 @@ NOTIFY --------------> 192.168.86.240:P  ----------> 192.168.139.2:P
 
 By default, the daemon listens on TCP ports 1400 through 1499 on the selected LAN address. Each port `P` proxies only to the configured or learned HA address on the same port `P`. The range allows SoCo to choose another listener port when 1400 is occupied. Unavailable ports are reported and skipped; startup fails if none can be bound.
 
-The bridge capture is confirmed ready before these LAN listeners are opened. If a callback still arrives while auto-detection is unresolved, its handler waits up to 0.75 seconds for concurrent HA/Sonos traffic to identify the backend before rejecting the connection.
+The bridge capture is confirmed ready before these LAN listeners are opened. If an early callback finds no unique accepting bridge neighbor, its handler waits up to 0.75 seconds for concurrent HA/Sonos packet traffic to identify the backend before rejecting the connection. Neighbor probes use the callback's same TCP port and successful probe sockets are closed immediately before the real forwarding connection is opened.
 
 ## Requirements
 
@@ -74,6 +80,7 @@ The bridge capture is confirmed ready before these LAN listeners are opened. If 
 - Home Assistant Container using OrbStack host networking
 - Python 3.10 or later, with no third-party packages
 - `/usr/sbin/tcpdump`
+- `/usr/sbin/arp`
 - Home Assistant's Sonos integration and Sonos devices on the physical LAN
 
 The LaunchDaemon runs as root because macOS BPF capture normally requires elevated privileges.
@@ -163,7 +170,7 @@ Useful checks:
 
 - `Waiting for interface bridge100` means OrbStack has not created the configured bridge or it has no IPv4 address yet.
 - Confirm the startup diagnostics show the expected LAN IP, bridge IP, HA mode/address, and callback ports.
-- In auto mode, look for `HA: learned and pinned OrbStack address ... from outbound Sonos TCP` or `... from SSDP M-SEARCH`. The capture starts before callback listeners, and an early callback waits briefly for concurrent detection. If neither kind of HA traffic occurs, trigger a Sonos action/poll or discovery, or set `HA_IP` explicitly.
+- In auto mode, look for a learned-address message ending in `from bridge neighbor accepting TCP :P`, `from outbound Sonos TCP`, or `from SSDP M-SEARCH`. An ambiguity message means multiple known bridge neighbors accepted the callback port, so none was selected. Trigger a Sonos action/poll or discovery, or set `HA_IP` explicitly.
 - Port warnings identify callback listeners already occupied by another process. A partial range is usable; no available ports is fatal.
 - Use `sudo lsof -nP -iTCP:1400 -sTCP:LISTEN` (changing the port as needed) to identify a conflict.
 - If searches appear on the bridge but no Sonos replies are forwarded, verify the Mac and speakers share the selected LAN, macOS firewall policy permits the traffic, and LAN client isolation is disabled.
@@ -204,7 +211,7 @@ Reducing `EVENT_PORTS` to the ports your installation actually uses narrows the 
 
 - This handles only the tested Home Assistant Sonos SSDP and event-callback mismatch across OrbStack/macOS.
 - It supports Ethernet-framed IPv4 UDP and TCP capture, with at most one VLAN tag. IPv6 and fragmented IPv4 packets are not used for detection or relaying.
-- Auto HA discovery depends on observing outbound TCP destination-port 1400 traffic or a suitable M-SEARCH. It intentionally pins the first qualifying in-subnet, non-bridge source until restart. Use `HA_IP` when more than one OrbStack client may contact Sonos or deterministic startup is important.
+- Auto HA discovery uses existing bridge neighbors plus observed outbound TCP destination-port 1400 traffic and suitable M-SEARCH packets. Neighbor probing is limited to existing ARP entries and the callback's port, but it still creates brief real TCP connections. Ambiguous accepting neighbors are not guessed. Use `HA_IP` when more than one OrbStack client may expose the same callback port or deterministic startup is important.
 - The SSDP classifier uses recognizable Sonos response markers; it is not device authentication.
 - Changes to macOS, OrbStack, Home Assistant, SoCo, interface naming, firewall behavior, or Sonos firmware may require new validation.
 - This does not relay multicast generally and does not make HA literally share the Mac's physical network identity.
